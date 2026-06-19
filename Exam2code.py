@@ -66,7 +66,7 @@ df_cards = pd.read_csv(RUTA_BASE + 'sd254_cards.csv')
 # los dtypes reducen el consumo de memoria desde el momento de la lectura
 df_trans = pd.read_csv(
     RUTA_BASE + 'credit_card_transactions-ibm_v2.csv',
-    nrows=14_000_000,
+    nrows=24_000_000,
     dtype={
         'User':  'int32',
         'Card':  'int32',
@@ -98,6 +98,8 @@ df_cards['Card on Dark Web'] = (df_cards['Card on Dark Web'].str.strip() == 'Yes
 df_cards['Expires']          = pd.to_datetime(df_cards['Expires'],        format='%m/%Y')
 df_cards['Acct Open Date']   = pd.to_datetime(df_cards['Acct Open Date'], format='%m/%Y')
 df_cards.rename(columns={'CARD INDEX': 'CARD_INDEX'}, inplace=True)
+# evita expansion de filas por tarjetas duplicadas en el catalogo
+df_cards.drop_duplicates(subset=['User', 'CARD_INDEX'], keep='last', inplace=True)
 
 # ─── limpieza: transacciones ──────────────────────────────────────────────────
 
@@ -416,13 +418,17 @@ print('F1 dummy:    ', round(f1_score(y_test, dummy.predict(X_test_sk)), 4))
 # ─── logistic regression ──────────────────────────────────────────────────────
 
 scaler     = StandardScaler()
-X_train_lr = scaler.fit_transform(X_train_sk.fillna(0))
-X_test_lr  = scaler.transform(X_test_sk.fillna(0))
+X_train_lr = scaler.fit_transform(X_train_sk.fillna(0).astype('float32'))
+X_test_lr  = scaler.transform(X_test_sk.fillna(0).astype('float32'))
 
 lr = LogisticRegression(class_weight='balanced', solver='saga', max_iter=200, random_state=42)
 lr.fit(X_train_lr, y_train)
+del X_train_lr
+gc.collect()
 y_proba_lr = lr.predict_proba(X_test_lr)[:, 1]
 pr_auc_lr, _ = evaluar('Logistic Regression', y_test, y_proba_lr)
+del X_test_lr
+gc.collect()
 
 # ─── decision tree ────────────────────────────────────────────────────────────
 
