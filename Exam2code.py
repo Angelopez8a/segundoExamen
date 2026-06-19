@@ -65,7 +65,7 @@ df_cards = pd.read_csv(RUTA_BASE + 'sd254_cards.csv')
 # los dtypes reducen el consumo de memoria desde el momento de la lectura
 df_trans = pd.read_csv(
     RUTA_BASE + 'credit_card_transactions-ibm_v2.csv',
-    nrows=5_000_000,
+    nrows=1_000_000,
     dtype={
         'User':  'int32',
         'Card':  'int32',
@@ -232,7 +232,8 @@ df.drop(columns=['Apartment'], inplace=True)
 # ordenamos cronologicamente para que cumsum solo vea transacciones anteriores
 
 df['_orden_original'] = np.arange(len(df))
-df = df.sort_values(['User', 'Year', 'Month', 'Day', 'hour', 'minute', 'Card']).reset_index(drop=True)
+df.sort_values(['User', 'Year', 'Month', 'Day', 'hour', 'minute', 'Card'], inplace=True)
+df.reset_index(drop=True, inplace=True)
 
 g_user = df.groupby('User', sort=False)
 df['txns_prev_usuario'] = g_user.cumcount().astype('int32')
@@ -313,7 +314,9 @@ df['tarjeta_en_varios_estados'] = (df['estados_distintos_dia_hasta_ahora'] > 1).
 gc.collect()
 
 # restauramos el orden original
-df = df.sort_values('_orden_original').drop(columns=['_orden_original']).reset_index(drop=True)
+df.sort_values('_orden_original', inplace=True)
+df.drop(columns=['_orden_original'], inplace=True)
+df.reset_index(drop=True, inplace=True)
 
 # ─── validacion de features binarias ─────────────────────────────────────────
 
@@ -356,7 +359,10 @@ print('grafica guardada: lift_features.png')
 
 cols_drop = ['Time', 'Errors?', 'Use Chip', 'User', 'fecha',
              'tasa_fraude_mcc', 'tasa_fraude_estado']
-df_model  = df.drop(columns=[c for c in cols_drop if c in df.columns])
+df.drop(columns=[c for c in cols_drop if c in df.columns], inplace=True)
+df_model = df
+del df
+gc.collect()
 
 print(f'shape final: {df_model.shape}')
 print(f'memoria: {df_model.memory_usage(deep=True).sum() / 1e9:.2f} GB')
@@ -477,7 +483,6 @@ try:
         feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=5,
-        device='gpu',
         n_jobs=-1,
         random_state=42,
         verbose=-1,
