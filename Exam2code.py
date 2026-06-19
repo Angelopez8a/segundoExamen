@@ -7,8 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.dummy import DummyClassifier
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
 from sklearn.metrics import (
     PrecisionRecallDisplay,
     average_precision_score,
@@ -16,7 +16,6 @@ from sklearn.metrics import (
     f1_score,
     precision_recall_curve,
 )
-from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
 matplotlib.use('Agg')
@@ -66,7 +65,7 @@ df_cards = pd.read_csv(RUTA_BASE + 'sd254_cards.csv')
 # los dtypes reducen el consumo de memoria desde el momento de la lectura
 df_trans = pd.read_csv(
     RUTA_BASE + 'credit_card_transactions-ibm_v2.csv',
-    nrows=24_000_000,
+    nrows=5_000_000,
     dtype={
         'User':  'int32',
         'Card':  'int32',
@@ -415,21 +414,6 @@ y_proba_dummy = dummy.predict_proba(X_test_sk)[:, 1]
 print('PR-AUC dummy:', round(average_precision_score(y_test, y_proba_dummy), 4))
 print('F1 dummy:    ', round(f1_score(y_test, dummy.predict(X_test_sk)), 4))
 
-# ─── logistic regression ──────────────────────────────────────────────────────
-
-scaler     = StandardScaler()
-X_train_lr = scaler.fit_transform(X_train_sk.fillna(0).astype('float32'))
-X_test_lr  = scaler.transform(X_test_sk.fillna(0).astype('float32'))
-
-lr = LogisticRegression(class_weight='balanced', solver='saga', max_iter=200, random_state=42)
-lr.fit(X_train_lr, y_train)
-del X_train_lr
-gc.collect()
-y_proba_lr = lr.predict_proba(X_test_lr)[:, 1]
-pr_auc_lr, _ = evaluar('Logistic Regression', y_test, y_proba_lr)
-del X_test_lr
-gc.collect()
-
 # ─── decision tree ────────────────────────────────────────────────────────────
 
 dt = DecisionTreeClassifier(
@@ -450,26 +434,38 @@ rf.fit(X_train_sk.fillna(-1), y_train)
 y_proba_rf = rf.predict_proba(X_test_sk.fillna(-1))[:, 1]
 pr_auc_rf, _ = evaluar('Random Forest', y_test, y_proba_rf)
 
-# ─── gradient boosting ────────────────────────────────────────────────────────
+# ─── xgboost (GPU) ────────────────────────────────────────────────────────────
 
-hgb = HistGradientBoostingClassifier(
-    max_iter=300, learning_rate=0.05, max_depth=8, min_samples_leaf=50,
-    class_weight='balanced', early_stopping=True, validation_fraction=0.1,
-    n_iter_no_change=20, random_state=42,
+scale_pw = n_neg / n_pos
+hgb = xgb.XGBClassifier(
+    n_estimators=500,
+    learning_rate=0.05,
+    max_depth=8,
+    min_child_weight=50,
+    scale_pos_weight=scale_pw,
+    early_stopping_rounds=20,
+    eval_metric='aucpr',
+    device='cuda',
+    random_state=42,
 )
-hgb.fit(X_train_sk, y_train)
-y_proba_hgb = hgb.predict_proba(X_test_sk)[:, 1]
-pr_auc_hgb, _ = evaluar('Gradient Boosting', y_test, y_proba_hgb)
+hgb.fit(
+    X_train_sk.fillna(-1), y_train,
+    eval_set=[(X_test_sk.fillna(-1), y_test)],
+    verbose=100,
+)
+y_proba_hgb = hgb.predict_proba(X_test_sk.fillna(-1))[:, 1]
+pr_auc_hgb, _ = evaluar('XGBoost', y_test, y_proba_hgb)
 
 # ─── lightgbm ─────────────────────────────────────────────────────────────────
 
 try:
     X_train_lgbm = X_train.copy()
     X_test_lgbm  = X_test.copy()
-    for col in CAT_COLS:
-        if col in X_train_lgbm.columns:
-            X_train_lgbm[col] = X_train_lgbm[col].cat.codes
-            X_test_lgbm[col]  = X_test_lgbm[col].cat.codes
+    cat_cols_presentes = [c for c in CAT_COLS if c in X_train_lgbm.columns]
+    for col in cat_cols_presentes:
+        # +1 shifts -1 (NaN code) to 0; LightGBM requires non-negative integer codes
+        X_train_lgbm[col] = (X_train_lgbm[col].cat.codes + 1).astype('int16')
+        X_test_lgbm[col]  = (X_test_lgbm[col].cat.codes + 1).astype('int16')
 
     lgbm = lgb.LGBMClassifier(
         objective='binary',
@@ -481,13 +477,14 @@ try:
         feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=5,
+        device='gpu',
         n_jobs=-1,
         random_state=42,
         verbose=-1,
     )
     lgbm.fit(
         X_train_lgbm, y_train,
-        categorical_feature=CAT_COLS,
+        categorical_feature=cat_cols_presentes,
         eval_set=[(X_test_lgbm, y_test)],
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)],
     )
@@ -512,10 +509,9 @@ except ImportError:
 # ─── comparacion de modelos ───────────────────────────────────────────────────
 
 fig, ax = plt.subplots(figsize=(8, 5))
-PrecisionRecallDisplay.from_predictions(y_test, y_proba_lr,  name=f'Logistic Regression (PR-AUC={pr_auc_lr:.3f})',  ax=ax)
 PrecisionRecallDisplay.from_predictions(y_test, y_proba_dt,  name=f'Decision Tree       (PR-AUC={pr_auc_dt:.3f})',  ax=ax)
 PrecisionRecallDisplay.from_predictions(y_test, y_proba_rf,  name=f'Random Forest       (PR-AUC={pr_auc_rf:.3f})',  ax=ax)
-PrecisionRecallDisplay.from_predictions(y_test, y_proba_hgb, name=f'Gradient Boosting   (PR-AUC={pr_auc_hgb:.3f})', ax=ax)
+PrecisionRecallDisplay.from_predictions(y_test, y_proba_hgb, name=f'XGBoost             (PR-AUC={pr_auc_hgb:.3f})', ax=ax)
 if lgbm_disponible:
     PrecisionRecallDisplay.from_predictions(y_test, y_proba_lgbm, name=f'LightGBM            (PR-AUC={pr_auc_lgbm:.3f})', ax=ax)
 ax.set_title('Precision-Recall — comparacion de modelos')
@@ -527,10 +523,9 @@ print('grafica guardada: precision_recall_modelos.png')
 # ─── resumen y guardar el mejor modelo ───────────────────────────────────────
 
 modelos_entrenados = {
-    'LogisticRegression': (lr,  pr_auc_lr),
-    'DecisionTree':       (dt,  pr_auc_dt),
-    'RandomForest':       (rf,  pr_auc_rf),
-    'GradientBoosting':   (hgb, pr_auc_hgb),
+    'DecisionTree': (dt,  pr_auc_dt),
+    'RandomForest': (rf,  pr_auc_rf),
+    'XGBoost':      (hgb, pr_auc_hgb),
 }
 if lgbm_disponible:
     modelos_entrenados['LightGBM'] = (lgbm, pr_auc_lgbm)
